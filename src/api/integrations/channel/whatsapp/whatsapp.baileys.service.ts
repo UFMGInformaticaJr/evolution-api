@@ -1332,6 +1332,17 @@ export class BaileysStartupService extends ChannelStartupService {
           this.historySyncChatCount = 0;
           this.historySyncContactCount = 0;
           this.historySyncLastProgress = -1;
+
+          // The historySyncNotification arrives well before the payload it announces, so the
+          // import it schedules can run against an empty buffer. Trigger it here as well, once
+          // the messages of the final batch have actually been buffered.
+          if (
+            this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
+            this.localChatwoot?.enabled &&
+            this.localChatwoot.importMessages
+          ) {
+            this.chatwootService.importHistoryMessages(instance);
+          }
         }
 
         await this.contactHandle['contacts.upsert'](
