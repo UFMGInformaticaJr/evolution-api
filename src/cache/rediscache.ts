@@ -103,7 +103,11 @@ export class RedisCache implements ICache {
         MATCH: match,
         COUNT: 100,
       })) {
-        keys.push(key);
+        if (Array.isArray(key)) {
+          keys.push(...key);
+        } else {
+          keys.push(key);
+        }
       }
 
       return [...new Set(keys)];
