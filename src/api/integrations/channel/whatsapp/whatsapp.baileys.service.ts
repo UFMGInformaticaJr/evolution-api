@@ -2381,12 +2381,6 @@ export class BaileysStartupService extends ChannelStartupService {
       if (msg.chunkOrder === 1) {
         this.chatwootService.startImportHistoryMessages(instance);
       }
-
-      if (msg.progress === 100) {
-        setTimeout(() => {
-          this.chatwootService.importHistoryMessages(instance);
-        }, 10000);
-      }
     }
 
     return true;
