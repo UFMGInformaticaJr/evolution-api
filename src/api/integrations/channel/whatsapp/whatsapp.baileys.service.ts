@@ -1217,6 +1217,7 @@ export class BaileysStartupService extends ChannelStartupService {
         this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
 
         const messagesRaw: any[] = [];
+        const chatwootMessagesRaw: any[] = [];
 
         const messagesRepository: Set<string> = new Set(
           chatwootImport.getRepositoryMessagesCache(instance) ??
@@ -1273,10 +1274,6 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          if (messagesRepository?.has(m.key.id)) {
-            continue;
-          }
-
           if (!m.pushName && !m.key.fromMe) {
             const participantJid = m.participant || m.key.participant || m.key.remoteJid;
             const participantLid = mKey.participantAlt || mKey.remoteJidAlt;
@@ -1291,7 +1288,19 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          messagesRaw.push(this.prepareMessage(m));
+          const preparedMessage = this.prepareMessage(m);
+
+          // messagesRepository only tracks what this instance already stored locally. The
+          // Chatwoot importer keeps its own dedup against Chatwoot's own database, so it has
+          // to see every message - otherwise re-pairing an instance whose messages are already
+          // in Postgres leaves the importer with nothing to import.
+          chatwootMessagesRaw.push(preparedMessage);
+
+          if (messagesRepository?.has(m.key.id)) {
+            continue;
+          }
+
+          messagesRaw.push(preparedMessage);
         }
 
         this.historySyncMessageCount += messagesRaw.length;
@@ -1309,11 +1318,11 @@ export class BaileysStartupService extends ChannelStartupService {
           this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
           this.localChatwoot?.enabled &&
           this.localChatwoot.importMessages &&
-          messagesRaw.length > 0
+          chatwootMessagesRaw.length > 0
         ) {
           this.chatwootService.addHistoryMessages(
             instance,
-            messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
+            chatwootMessagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
           );
         }
 
