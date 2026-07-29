@@ -223,6 +223,7 @@ class ChatwootImport {
       let totalMessagesImported = 0;
 
       let messagesOrdered = this.historyMessages.get(instance.instanceName) || [];
+      this.logger.log(`[import] buffered messages for "${instance.instanceName}": ${messagesOrdered.length}`);
       if (messagesOrdered.length === 0) {
         return 0;
       }
@@ -255,6 +256,9 @@ class ChatwootImport {
 
       const existingSourceIds = await this.getExistingSourceIds(messagesOrdered.map((message: any) => message.key.id));
       messagesOrdered = messagesOrdered.filter((message: any) => !existingSourceIds.has(message.key.id));
+      this.logger.log(
+        `[import] phoneNumbers=${phoneNumbersWithTimestamp.size} alreadyInChatwoot=${existingSourceIds.size} toImport=${messagesOrdered.length}`,
+      );
       // processing messages in batch
       const batchSize = 4000;
       let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
@@ -276,22 +280,32 @@ class ChatwootImport {
             sender_type, sender_id, source_id, created_at, updated_at) VALUES `;
           const bindInsertMsg = [provider.accountId, inbox.id];
 
+          let skippedNoBody = 0;
+          let skippedNoFks = 0;
+          let skippedNoContent = 0;
+          let queued = 0;
+
           messagesByPhoneNumber.forEach((messages: any[], phoneNumber: string) => {
             const fksChatwoot = fksByNumber.get(phoneNumber);
 
             messages.forEach((message) => {
               if (!message.message) {
+                skippedNoBody++;
                 return;
               }
 
               if (!fksChatwoot?.conversation_id || !fksChatwoot?.contact_id) {
+                skippedNoFks++;
                 return;
               }
 
               const contentMessage = this.getContentMessage(chatwootService, message);
               if (!contentMessage) {
+                skippedNoContent++;
                 return;
               }
+
+              queued++;
 
               bindInsertMsg.push(contentMessage);
               const bindContent = `$${bindInsertMsg.length}`;
@@ -318,6 +332,10 @@ class ChatwootImport {
                   ${bindSenderType},${bindSenderId},${bindSourceId}, to_timestamp(${bindmessageTimestamp}), to_timestamp(${bindmessageTimestamp})),`;
             });
           });
+          this.logger.log(
+            `[import] chunk: numbers=${messagesByPhoneNumber.size} fksResolved=${fksByNumber.size} queued=${queued} skipped(noBody=${skippedNoBody}, noFks=${skippedNoFks}, noContent=${skippedNoContent})`,
+          );
+
           if (bindInsertMsg.length > 2) {
             if (sqlInsertMsg.slice(-1) === ',') {
               sqlInsertMsg = sqlInsertMsg.slice(0, -1);
