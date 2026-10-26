@@ -283,6 +283,14 @@ export class BaileysStartupService extends ChannelStartupService {
   // The numeric WhatsApp stream-error code that triggers the grace-period reconnect above.
   private static readonly STREAM_ERROR_CODE_RECONNECT = '515';
 
+  // A 408 close means keep-alives timed out (network drop, primary device offline), not a
+  // logout, so the session is still valid. Retry with backoff instead of reconnecting in a
+  // tight loop; once the retries run out, close but keep the credentials so a later
+  // reconnect (e.g. `/connect` from Chatwoot) can resume without a new QR code.
+  private static readonly TIMEOUT_RECONNECT_MAX_ATTEMPTS = 5;
+  private static readonly TIMEOUT_RECONNECT_BASE_DELAY_MS = 3_000;
+  private timeoutReconnectAttempts = 0;
+
   public stateConnection: wa.StateConnection = { state: 'close' };
 
   public phoneNumber: string;
@@ -528,13 +536,28 @@ export class BaileysStartupService extends ChannelStartupService {
         instanceName: this.instance.name,
       });
 
-      if (shouldReconnect) {
+      // Expired QR codes also close with 408 ("QR refs attempts ended"); only a paired session is worth keeping.
+      const isTimeout = statusCode === DisconnectReason.timedOut && !!this.instance.authState?.state?.creds?.me;
+
+      if (isTimeout && this.timeoutReconnectAttempts < BaileysStartupService.TIMEOUT_RECONNECT_MAX_ATTEMPTS) {
+        this.timeoutReconnectAttempts++;
+        const delayMs =
+          BaileysStartupService.TIMEOUT_RECONNECT_BASE_DELAY_MS * 2 ** (this.timeoutReconnectAttempts - 1);
+        this.logger.info(
+          `Connection timed out, reconnecting in ${delayMs / 1000}s ` +
+            `(attempt ${this.timeoutReconnectAttempts}/${BaileysStartupService.TIMEOUT_RECONNECT_MAX_ATTEMPTS})`,
+        );
+        setTimeout(async () => {
+          await this.connectToWhatsapp(this.phoneNumber);
+        }, delayMs);
+      } else if (shouldReconnect) {
         // Add 3 second delay before reconnection to prevent rapid reconnection loops
         this.logger.info('Reconnecting in 3 seconds...');
         setTimeout(async () => {
           await this.connectToWhatsapp(this.phoneNumber);
         }, 3000);
       } else {
+        this.timeoutReconnectAttempts = 0;
         this.logger.info(`Skipping reconnection for status code ${statusCode} (code is in codesToNotReconnect list)`);
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
@@ -558,11 +581,14 @@ export class BaileysStartupService extends ChannelStartupService {
           this.chatwootService.eventWhatsapp(
             Events.STATUS_INSTANCE,
             { instanceName: this.instance.name, instanceId: this.instanceId },
-            { instance: this.instance.name, status: 'closed' },
+            { instance: this.instance.name, status: 'closed', disconnectionReasonCode: statusCode },
           );
         }
 
-        this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
+        // Only a real logout invalidates the session; keep credentials after a timeout.
+        if (!isTimeout) {
+          this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
+        }
         this.client?.ws?.close();
         this.client.end(new Error('Close connection'));
 
@@ -575,6 +601,7 @@ export class BaileysStartupService extends ChannelStartupService {
         this.logger.warn('connectionUpdate: connection open but client.user is undefined, skipping');
         return;
       }
+      this.timeoutReconnectAttempts = 0;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
