@@ -1037,6 +1037,55 @@ export class ChatwootService {
     );
   }
 
+  // Bot alerts (disconnects, QR codes) must reach the team even after someone
+  // resolved the bot conversation, so reopen it — or start one — instead of
+  // dropping the message.
+  private async getBotConversation(
+    instance: InstanceDto,
+    inbox: inbox,
+    contact: generic_id & contact,
+  ): Promise<conversation> {
+    const openConversation = await this.getOpenConversationByContact(instance, inbox, contact);
+
+    if (openConversation) {
+      return openConversation;
+    }
+
+    const client = await this.clientCw(instance);
+
+    if (!client) {
+      this.logger.warn('client not found');
+      return null;
+    }
+
+    const conversations = (await client.contacts.listConversations({
+      accountId: this.provider.accountId,
+      id: contact.id,
+    })) as any;
+
+    const inboxConversation = conversations?.payload?.find((conversation) => conversation.inbox_id === inbox.id);
+
+    if (inboxConversation) {
+      await client.conversations.toggleStatus({
+        accountId: this.provider.accountId,
+        conversationId: inboxConversation.id,
+        data: {
+          status: 'open',
+        },
+      });
+
+      return inboxConversation;
+    }
+
+    return (await client.conversations.create({
+      accountId: this.provider.accountId,
+      data: {
+        contact_id: contact.id.toString(),
+        inbox_id: inbox.id.toString(),
+      },
+    })) as any;
+  }
+
   public async createBotMessage(
     instance: InstanceDto,
     content: string,
@@ -1068,7 +1117,7 @@ export class ChatwootService {
       return null;
     }
 
-    const conversation = await this.getOpenConversationByContact(instance, filterInbox, contact);
+    const conversation = await this.getBotConversation(instance, filterInbox, contact);
 
     if (!conversation) {
       this.logger.warn('conversation not found');
@@ -1199,7 +1248,7 @@ export class ChatwootService {
       return null;
     }
 
-    const conversation = await this.getOpenConversationByContact(instance, filterInbox, contact);
+    const conversation = await this.getBotConversation(instance, filterInbox, contact);
 
     if (!conversation) {
       this.logger.warn('conversation not found');
@@ -2640,10 +2689,16 @@ export class ChatwootService {
           return;
         }
 
-        const msgStatus = i18next.t('cw.inbox.status', {
-          inboxName: inbox.name,
-          state: data.status,
-        });
+        const msgStatus =
+          data.status === 'closed'
+            ? i18next.t('cw.inbox.disconnected', {
+                inboxName: inbox.name,
+                reason: data.disconnectionReasonCode ?? '-',
+              })
+            : i18next.t('cw.inbox.status', {
+                inboxName: inbox.name,
+                state: data.status,
+              });
 
         await this.createBotMessage(instance, msgStatus, 'incoming');
       }
@@ -2837,13 +2892,15 @@ export class ChatwootService {
 
     this.createBotMessage(instance, i18next.t('cw.import.importingMessages'), 'incoming');
 
-    const totalMessagesImported = await chatwootImport.importHistoryMessages(
-      instance,
-      this,
-      await this.getInbox(instance),
-      this.provider,
-    );
+    const inbox = await this.getInbox(instance);
+    const lastMessageIdBeforeImport = await this.getLastChatwootMessageId();
+
+    const totalMessagesImported = await chatwootImport.importHistoryMessages(instance, this, inbox, this.provider);
     this.updateContactAvatarInRecentConversations(instance);
+
+    if (totalMessagesImported > 0) {
+      await this.reopenConversationsMissedWhileOffline(instance, inbox, lastMessageIdBeforeImport);
+    }
 
     const msg = Number.isInteger(totalMessagesImported)
       ? i18next.t('cw.import.messagesImported', { totalMessagesImported })
@@ -2852,6 +2909,86 @@ export class ChatwootService {
     this.createBotMessage(instance, msg, 'incoming');
 
     return totalMessagesImported;
+  }
+
+  private async getLastChatwootMessageId(): Promise<number> {
+    try {
+      const { rows } = await this.pgClient.query('SELECT COALESCE(MAX(id), 0) AS id FROM messages');
+      return Number(rows[0]?.id ?? 0);
+    } catch (error) {
+      this.logger.error(`Error reading last Chatwoot message id: ${error}`);
+      return null;
+    }
+  }
+
+  // The history sync that follows a reconnect backfills what customers sent while the
+  // instance was offline, but the import writes straight into the database, so those
+  // messages land silently in conversations that may already be resolved. Reopen the
+  // conversations that got customer messages after the last disconnection so the team sees them.
+  private async reopenConversationsMissedWhileOffline(
+    instance: InstanceDto,
+    inbox: inbox,
+    lastMessageIdBeforeImport: number,
+  ) {
+    try {
+      if (!inbox || lastMessageIdBeforeImport === null) {
+        return;
+      }
+
+      const { disconnectionAt } =
+        (await this.prismaRepository.instance.findFirst({
+          where: { name: instance.instanceName },
+          select: { disconnectionAt: true },
+        })) ?? {};
+
+      if (!disconnectionAt) {
+        return;
+      }
+
+      const sql = `SELECT conversation_id, MAX(created_at) AS last_message_at
+        FROM messages
+        WHERE account_id = $1 AND inbox_id = $2 AND id > $3
+          AND message_type = 0 AND created_at >= to_timestamp($4)
+        GROUP BY conversation_id`;
+
+      const { rows } = await this.pgClient.query(sql, [
+        this.provider.accountId,
+        inbox.id,
+        lastMessageIdBeforeImport,
+        disconnectionAt.getTime() / 1000,
+      ]);
+
+      if (!rows?.length) {
+        return;
+      }
+
+      const client = await this.clientCw(instance);
+
+      for (const row of rows) {
+        await this.pgClient.query(
+          'UPDATE conversations SET last_activity_at = GREATEST(last_activity_at, $2) WHERE id = $1',
+          [row.conversation_id, row.last_message_at],
+        );
+
+        await client?.conversations.toggleStatus({
+          accountId: this.provider.accountId,
+          conversationId: row.conversation_id,
+          data: {
+            status: this.provider.conversationPending ? 'pending' : 'open',
+          },
+        });
+      }
+
+      this.logger.log(`[import] reopened ${rows.length} conversations with messages received while offline`);
+
+      await this.createBotMessage(
+        instance,
+        i18next.t('cw.import.missedConversationsReopened', { count: rows.length }),
+        'incoming',
+      );
+    } catch (error) {
+      this.logger.error(`Error reopening conversations missed while offline: ${error}`);
+    }
   }
 
   public async updateContactAvatarInRecentConversations(instance: InstanceDto, limitContacts = 100) {
@@ -2912,6 +3049,26 @@ export class ChatwootService {
     }
   }
 
+  // Lost-message sync normally looks back 6 hours. After a disconnection it reaches back to when
+  // the instance went offline (up to a week), so messages that only arrived through the history
+  // sync on reconnect are also copied to Chatwoot.
+  private async getLostMessagesWindowStart(instance: InstanceDto): Promise<number> {
+    const defaultStart = dayjs().subtract(6, 'hours');
+    const maxStart = dayjs().subtract(7, 'days');
+
+    const { disconnectionAt } =
+      (await this.prismaRepository.instance.findFirst({
+        where: { name: instance.instanceName },
+        select: { disconnectionAt: true },
+      })) ?? {};
+
+    if (!disconnectionAt || dayjs(disconnectionAt).isAfter(defaultStart)) {
+      return defaultStart.unix();
+    }
+
+    return Math.max(dayjs(disconnectionAt).unix(), maxStart.unix());
+  }
+
   public async syncLostMessages(
     instance: InstanceDto,
     chatwootConfig: ChatwootDto,
@@ -2926,14 +3083,15 @@ export class ChatwootService {
       }
 
       const inbox = await this.getInbox(instance);
+      const since = await this.getLostMessagesWindowStart(instance);
 
       const sqlMessages = `select * from messages m
-      where account_id = ${chatwootConfig.accountId}
-      and inbox_id = ${inbox.id}
-      and created_at >= now() - interval '6h'
+      where account_id = $1
+      and inbox_id = $2
+      and created_at >= to_timestamp($3)
       order by created_at desc`;
 
-      const messagesData = (await this.pgClient.query(sqlMessages))?.rows;
+      const messagesData = (await this.pgClient.query(sqlMessages, [chatwootConfig.accountId, inbox.id, since]))?.rows;
       const ids: string[] = messagesData
         .filter((message) => !!message.source_id)
         .map((message) => message.source_id.replace('WAID:', ''));
@@ -2941,7 +3099,7 @@ export class ChatwootService {
       const savedMessages = await this.prismaRepository.message.findMany({
         where: {
           Instance: { name: instance.instanceName },
-          messageTimestamp: { gte: Number(dayjs().subtract(6, 'hours').unix()) },
+          messageTimestamp: { gte: since },
           AND: ids.map((id) => ({ key: { path: ['id'], not: id } })),
         },
       });
@@ -2967,7 +3125,13 @@ export class ChatwootService {
         messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
       );
 
-      await chatwootImport.importHistoryMessages(instance, this, inbox, this.provider);
+      const lastMessageIdBeforeImport = await this.getLastChatwootMessageId();
+      const totalMessagesImported = await chatwootImport.importHistoryMessages(instance, this, inbox, this.provider);
+
+      if (totalMessagesImported > 0) {
+        await this.reopenConversationsMissedWhileOffline(instance, inbox, lastMessageIdBeforeImport);
+      }
+
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       waInstance.clearCacheChatwoot();
     } catch {
