@@ -255,7 +255,8 @@ class ChatwootImport {
       });
 
       const existingSourceIds = await this.getExistingSourceIds(messagesOrdered.map((message: any) => message.key.id));
-      messagesOrdered = messagesOrdered.filter((message: any) => !existingSourceIds.has(message.key.id));
+      // getExistingSourceIds returns ids with the `WAID:` prefix Chatwoot stores them with.
+      messagesOrdered = messagesOrdered.filter((message: any) => !existingSourceIds.has(`WAID:${message.key.id}`));
       this.logger.log(
         `[import] phoneNumbers=${phoneNumbersWithTimestamp.size} alreadyInChatwoot=${existingSourceIds.size} toImport=${messagesOrdered.length}`,
       );
@@ -410,7 +411,8 @@ class ChatwootImport {
                       AND con.account_id = $1
                       AND con.inbox_id = $2
                       AND con.contact_id = contacts.id
-                  WHERE contacts.account_id = $1
+                  -- A single contact without phone_number would make NOT IN match nothing.
+                  WHERE contacts.account_id = $1 AND contacts.phone_number IS NOT NULL
                 )
               ),
 
