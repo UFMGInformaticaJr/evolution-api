@@ -12,7 +12,7 @@
   "cw.import.startImport": "💬 Starting to import messages. Please wait...",
   "cw.import.importingMessages": "💬 Importing messages. More one moment...",
   "cw.import.messagesImported": "💬 {{totalMessagesImported}} messages imported. Refresh page to see the new messages.",
-  "cw.import.missedConversationsReopened": "📬 {{count}} conversations received messages while WhatsApp was disconnected and were reopened.",
+  "cw.import.missedConversationsReopened": "📬 {{count}} conversations had messages that had not reached Chatwoot; they were recovered and the conversations reopened.",
   "cw.import.messagesException": "💬 Something went wrong in importing messages.",
   "cw.locationMessage.location": "Location",
   "cw.locationMessage.latitude": "Latitude",

@@ -1903,6 +1903,7 @@ export class ChatwootService {
       listResponseMessage: msg.listResponseMessage,
       orderMessage: msg.orderMessage,
       quotedProductMessage: msg.contextInfo?.quotedMessage?.productMessage,
+      templateMessage: msg.templateMessage?.hydratedTemplate?.hydratedContentText,
       viewOnceMessageV2:
         msg?.message?.viewOnceMessageV2?.message?.imageMessage?.url ||
         msg?.message?.viewOnceMessageV2?.message?.videoMessage?.url ||
@@ -2280,6 +2281,15 @@ export class ChatwootService {
         if (!bodyMessage && !isMedia && !reactionMessage && !isInteractiveButtonMessage) {
           this.logger.warn('no body message found');
           return;
+        }
+
+        // WhatsApp can deliver the same message twice (e.g. after a decryption retry); don't post it again.
+        if (body.key?.id && this.isImportHistoryAvailable()) {
+          const existing = await chatwootImport.getExistingSourceIds([body.key.id]);
+          if (existing.size > 0) {
+            this.logger.verbose(`message ${body.key.id} already in Chatwoot, skipping`);
+            return;
+          }
         }
 
         const getConversation = await this.createConversation(instance, body);
@@ -2979,7 +2989,7 @@ export class ChatwootService {
         });
       }
 
-      this.logger.log(`[import] reopened ${rows.length} conversations with messages received while offline`);
+      this.logger.log(`[import] reopened ${rows.length} conversations with recovered messages`);
 
       await this.createBotMessage(
         instance,
