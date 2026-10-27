@@ -291,6 +291,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private static readonly TIMEOUT_RECONNECT_BASE_DELAY_MS = 3_000;
   private timeoutReconnectAttempts = 0;
 
+  // When the current outage started, so Chatwoot can skip "connected" notices after brief drops.
+  private lastDisconnectAt: number = null;
+
   public stateConnection: wa.StateConnection = { state: 'close' };
 
   public phoneNumber: string;
@@ -502,6 +505,8 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
+      this.lastDisconnectAt ??= Date.now();
+
       // Check if instance is being deleted or session is ending
       if (this.isDeleting || this.endSession) {
         this.logger.info('Instance is being deleted/ended, skipping reconnection attempt');
@@ -634,11 +639,14 @@ export class BaileysStartupService extends ChannelStartupService {
         },
       });
 
+      const downtimeMs = this.lastDisconnectAt ? Date.now() - this.lastDisconnectAt : 0;
+      this.lastDisconnectAt = null;
+
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
         this.chatwootService.eventWhatsapp(
           Events.CONNECTION_UPDATE,
           { instanceName: this.instance.name, instanceId: this.instanceId },
-          { instance: this.instance.name, status: 'open' },
+          { instance: this.instance.name, status: 'open', downtimeMs },
         );
         this.syncChatwootLostMessages();
       }

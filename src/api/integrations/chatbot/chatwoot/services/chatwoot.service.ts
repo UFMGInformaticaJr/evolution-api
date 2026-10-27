@@ -66,6 +66,9 @@ export class ChatwootService {
 
   private pgClient = postgresClient.getChatwootConnection();
 
+  // Automatic reconnects are only announced in Chatwoot when the instance was offline at least this long.
+  private static readonly RECONNECT_NOTIFY_MIN_DOWNTIME_MS = 2 * 60 * 1000;
+
   private async getProvider(instance: InstanceDto): Promise<ChatwootModel | null> {
     const cacheKey = `${instance.instanceName}:getProvider`;
     if (await this.cache.has(cacheKey)) {
@@ -2718,7 +2721,7 @@ export class ChatwootService {
         if (!waInstance) return;
 
         const now = Date.now();
-        const timeSinceLastNotification = now - (waInstance.lastConnectionNotification || 0);
+        const downtimeMs: number = body.downtimeMs ?? 0;
 
         // Se a conexão foi estabelecida via QR code, notifica imediatamente.
         if (waInstance.qrCode && waInstance.qrCode.count > 0) {
@@ -2728,14 +2731,14 @@ export class ChatwootService {
           waInstance.lastConnectionNotification = now;
           chatwootImport.clearAll(instance);
         }
-        // Se não foi via QR code, verifica o throttling.
-        else if (timeSinceLastNotification >= 30000) {
+        // Reconexões automáticas só são avisadas quando a queda foi longa; quedas rápidas são rotina.
+        else if (downtimeMs >= ChatwootService.RECONNECT_NOTIFY_MIN_DOWNTIME_MS) {
           const msgConnection = i18next.t('cw.inbox.connected');
           await this.createBotMessage(instance, msgConnection, 'incoming');
           waInstance.lastConnectionNotification = now;
         } else {
-          this.logger.warn(
-            `Connection notification skipped for ${instance.instanceName} - too frequent (${timeSinceLastNotification}ms since last)`,
+          this.logger.verbose(
+            `Connection notification skipped for ${instance.instanceName} - offline for only ${Math.round(downtimeMs / 1000)}s`,
           );
         }
       }
