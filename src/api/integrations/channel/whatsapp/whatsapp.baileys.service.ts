@@ -291,6 +291,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private static readonly TIMEOUT_RECONNECT_BASE_DELAY_MS = 3_000;
   private timeoutReconnectAttempts = 0;
 
+  // A reconnect can fail before reaching WhatsApp (e.g. the database is down). Keep trying, and
+  // tell the team if it lasts, since no close event will fire to report it.
+  private static readonly RECONNECT_ERROR_RETRY_MS = 30_000;
+  private static readonly RECONNECT_ERROR_ALERT_AFTER = 5;
+  private reconnectErrors = 0;
+
   // When the current outage started, so Chatwoot can skip "connected" notices after brief drops.
   private lastDisconnectAt: number = null;
 
@@ -541,10 +547,15 @@ export class BaileysStartupService extends ChannelStartupService {
         instanceName: this.instance.name,
       });
 
-      // Expired QR codes also close with 408 ("QR refs attempts ended"); only a paired session is worth keeping.
-      const isTimeout = statusCode === DisconnectReason.timedOut && !!this.instance.authState?.state?.creds?.me;
+      const isTimeout = statusCode === DisconnectReason.timedOut;
+      // Expired QR codes also close with 408 ("QR refs attempts ended"); there is nothing to reconnect to yet.
+      const isPaired = !!this.instance.authState?.state?.creds?.me;
 
-      if (isTimeout && this.timeoutReconnectAttempts < BaileysStartupService.TIMEOUT_RECONNECT_MAX_ATTEMPTS) {
+      if (
+        isTimeout &&
+        isPaired &&
+        this.timeoutReconnectAttempts < BaileysStartupService.TIMEOUT_RECONNECT_MAX_ATTEMPTS
+      ) {
         this.timeoutReconnectAttempts++;
         const delayMs =
           BaileysStartupService.TIMEOUT_RECONNECT_BASE_DELAY_MS * 2 ** (this.timeoutReconnectAttempts - 1);
@@ -552,15 +563,11 @@ export class BaileysStartupService extends ChannelStartupService {
           `Connection timed out, reconnecting in ${delayMs / 1000}s ` +
             `(attempt ${this.timeoutReconnectAttempts}/${BaileysStartupService.TIMEOUT_RECONNECT_MAX_ATTEMPTS})`,
         );
-        setTimeout(async () => {
-          await this.connectToWhatsapp(this.phoneNumber);
-        }, delayMs);
+        this.scheduleReconnect(delayMs);
       } else if (shouldReconnect) {
         // Add 3 second delay before reconnection to prevent rapid reconnection loops
         this.logger.info('Reconnecting in 3 seconds...');
-        setTimeout(async () => {
-          await this.connectToWhatsapp(this.phoneNumber);
-        }, 3000);
+        this.scheduleReconnect(3000);
       } else {
         this.timeoutReconnectAttempts = 0;
         this.logger.info(`Skipping reconnection for status code ${statusCode} (code is in codesToNotReconnect list)`);
@@ -572,25 +579,23 @@ export class BaileysStartupService extends ChannelStartupService {
           disconnectionObject: JSON.stringify(lastDisconnect),
         });
 
-        await this.prismaRepository.instance.update({
-          where: { id: this.instanceId },
-          data: {
-            connectionStatus: 'close',
-            disconnectionAt: new Date(),
-            disconnectionReasonCode: statusCode,
-            disconnectionObject: JSON.stringify(lastDisconnect),
-          },
-        });
+        this.alertDisconnected(statusCode);
 
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-          this.chatwootService.eventWhatsapp(
-            Events.STATUS_INSTANCE,
-            { instanceName: this.instance.name, instanceId: this.instanceId },
-            { instance: this.instance.name, status: 'closed', disconnectionReasonCode: statusCode },
-          );
+        try {
+          await this.prismaRepository.instance.update({
+            where: { id: this.instanceId },
+            data: {
+              connectionStatus: 'close',
+              disconnectionAt: new Date(),
+              disconnectionReasonCode: statusCode,
+              disconnectionObject: JSON.stringify(lastDisconnect),
+            },
+          });
+        } catch (error) {
+          this.logger.error(`Could not record the disconnection: ${error}`);
         }
 
-        // Only a real logout invalidates the session; keep credentials after a timeout.
+        // Only a real logout invalidates the session; a timeout must never delete credentials.
         if (!isTimeout) {
           this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
         }
@@ -607,6 +612,7 @@ export class BaileysStartupService extends ChannelStartupService {
         return;
       }
       this.timeoutReconnectAttempts = 0;
+      this.reconnectErrors = 0;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -662,6 +668,39 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'connecting') {
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+    }
+  }
+
+  private scheduleReconnect(delayMs: number) {
+    setTimeout(async () => {
+      if (this.isDeleting || this.endSession) {
+        return;
+      }
+
+      try {
+        await this.connectToWhatsapp(this.phoneNumber);
+      } catch (error) {
+        this.reconnectErrors++;
+        this.logger.error(
+          `Reconnect failed (${this.reconnectErrors}), retrying in ` +
+            `${BaileysStartupService.RECONNECT_ERROR_RETRY_MS / 1000}s: ${error}`,
+        );
+
+        if (this.reconnectErrors === BaileysStartupService.RECONNECT_ERROR_ALERT_AFTER) {
+          this.alertDisconnected(DisconnectReason.connectionLost);
+        }
+
+        this.scheduleReconnect(BaileysStartupService.RECONNECT_ERROR_RETRY_MS);
+      }
+    }, delayMs);
+  }
+
+  private alertDisconnected(statusCode: number) {
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+      this.chatwootService.alertDisconnected(
+        { instanceName: this.instance.name, instanceId: this.instanceId },
+        statusCode,
+      );
     }
   }
 

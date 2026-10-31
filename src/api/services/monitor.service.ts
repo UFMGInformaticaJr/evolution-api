@@ -313,6 +313,7 @@ export class WAMonitoringService {
     if (
       instanceData.connectionStatus === 'open' ||
       instanceData.connectionStatus === 'connecting' ||
+      (await this.hasPairedSession(instanceData.instanceId)) ||
       instanceData.integration === Integration.EVOLUTION ||
       instanceData.integration === Integration.EVOHUB
     ) {
@@ -327,6 +328,23 @@ export class WAMonitoringService {
     }
 
     this.waInstances[instanceData.instanceName] = instance;
+  }
+
+  // A real logout deletes the session, so a paired one on a closed instance means it gave up after
+  // connection timeouts. Such a session can resume by itself once the server is back.
+  private async hasPairedSession(instanceId: string): Promise<boolean> {
+    try {
+      const session = await this.prismaRepository.session.findUnique({ where: { sessionId: instanceId } });
+      if (!session?.creds) return false;
+
+      const stored = JSON.parse(session.creds);
+      const creds = typeof stored === 'string' ? JSON.parse(stored) : stored;
+
+      return !!creds?.me;
+    } catch (error) {
+      this.logger.error(`Could not read session of instance ${instanceId}: ${error}`);
+      return false;
+    }
   }
 
   private async loadInstancesFromRedis() {

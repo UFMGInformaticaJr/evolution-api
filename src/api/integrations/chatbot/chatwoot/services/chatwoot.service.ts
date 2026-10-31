@@ -69,6 +69,9 @@ export class ChatwootService {
   // Automatic reconnects are only announced in Chatwoot when the instance was offline at least this long.
   private static readonly RECONNECT_NOTIFY_MIN_DOWNTIME_MS = 2 * 60 * 1000;
 
+  private static readonly DISCONNECT_ALERT_RETRY_MS = 30_000;
+  private static readonly DISCONNECT_ALERT_MAX_ATTEMPTS = 20;
+
   private async getProvider(instance: InstanceDto): Promise<ChatwootModel | null> {
     const cacheKey = `${instance.instanceName}:getProvider`;
     if (await this.cache.has(cacheKey)) {
@@ -2162,6 +2165,45 @@ export class ChatwootService {
     const messageContent = this.getMessageContent(types);
 
     return messageContent;
+  }
+
+  // The disconnect that matters most can come with the database or Chatwoot struggling too,
+  // so keep trying instead of losing the alert, and drop it if the connection came back.
+  public async alertDisconnected(instance: InstanceDto, reasonCode: number, attempt = 1) {
+    if (this.waMonitor.waInstances[instance.instanceName]?.connectionStatus?.state === 'open') {
+      return;
+    }
+
+    let sent = null;
+
+    try {
+      const inbox = await this.getInbox(instance);
+
+      if (inbox) {
+        sent = await this.createBotMessage(
+          instance,
+          i18next.t('cw.inbox.disconnected', { inboxName: inbox.name, reason: reasonCode ?? '-' }),
+          'incoming',
+        );
+      }
+    } catch (error) {
+      this.logger.error(`Error sending disconnect alert: ${error}`);
+    }
+
+    if (sent) {
+      return;
+    }
+
+    if (attempt >= ChatwootService.DISCONNECT_ALERT_MAX_ATTEMPTS) {
+      this.logger.error(`Giving up on disconnect alert for ${instance.instanceName} after ${attempt} attempts`);
+      return;
+    }
+
+    this.logger.warn(`Disconnect alert not delivered (attempt ${attempt}), retrying`);
+    setTimeout(
+      () => this.alertDisconnected(instance, reasonCode, attempt + 1),
+      ChatwootService.DISCONNECT_ALERT_RETRY_MS,
+    );
   }
 
   public async eventWhatsapp(event: string, instance: InstanceDto, body: any) {

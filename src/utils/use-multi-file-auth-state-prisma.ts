@@ -44,15 +44,11 @@ export async function saveKey(sessionId: string, keyJson: any): Promise<any> {
   }
 }
 
+// Database errors propagate on purpose: callers must be able to tell "no session" from "could not read it".
 export async function getAuthKey(sessionId: string): Promise<any> {
-  try {
-    const register = await keyExists(sessionId);
-    if (!register) return null;
-    const auth = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
-    return JSON.parse(auth?.creds);
-  } catch {
-    return null;
-  }
+  const auth = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
+  if (!auth) return null;
+  return JSON.parse(auth.creds);
 }
 
 async function deleteAuthKey(sessionId: string): Promise<any> {
@@ -166,7 +162,10 @@ export default async function useMultiFileAuthStatePrisma(
     await deleteAuthKey(sessionId);
   }
 
-  let creds = await readData('creds');
+  // Only a session that really does not exist gets new credentials. Treating a failed read as
+  // "no session" would replace a paired device with an unpaired one and ask for a new QR code.
+  const storedCreds = await getAuthKey(sessionId);
+  let creds = storedCreds ? JSON.parse(storedCreds, BufferJSON.reviver) : null;
   if (!creds) {
     creds = initAuthCreds();
     await writeData(creds, 'creds');
